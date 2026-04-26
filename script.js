@@ -554,10 +554,48 @@ function isCurrentTurnControlledByAI(){
   return !gameOver && Boolean(aiToggle?.checked) && Number(aiPlayerSelect?.value) === currentPlayer;
 }
 
+function interpolateLogRate(rating, left, right){
+  if (left.rate <= 0 || right.rate <= 0 || right.rating === left.rating) return left.rate;
+  const t = (rating - left.rating) / (right.rating - left.rating);
+  return Math.exp(Math.log(left.rate) + (Math.log(right.rate) - Math.log(left.rate)) * t);
+}
+
+function ratingToRuminationNps(rating){
+  const anchors = [
+    { rating: 250, rate: 80e9 },
+    { rating: 500, rate: 40e9 },
+    { rating: 750, rate: 20e9 },
+    { rating: 1000, rate: 10e9 },
+    { rating: 1250, rate: 5e9 },
+    { rating: 1500, rate: 100e9 },
+    { rating: 1750, rate: 125e9 },
+    { rating: 2000, rate: 250e9 },
+    { rating: 2250, rate: 500e9 },
+    { rating: 2500, rate: 1e12 },
+    { rating: 2750, rate: 2e12 }
+  ];
+
+  const clamped = Math.max(anchors[0].rating, Math.min(anchors[anchors.length - 1].rating, Number(rating) || 1500));
+  for (let i = 1; i < anchors.length; i++) {
+    if (clamped <= anchors[i].rating) return interpolateLogRate(clamped, anchors[i - 1], anchors[i]);
+  }
+  return anchors[anchors.length - 1].rate;
+}
+
 function formatNodeRate(nps){
-  if (nps >= 1000000) return `${(nps / 1000000).toFixed(nps >= 10000000 ? 0 : 1)}M n/s`;
-  if (nps >= 1000) return `${(nps / 1000).toFixed(nps >= 100000 ? 0 : 1)}k n/s`;
+  if (nps >= 1e12) return `${(nps / 1e12).toFixed(nps >= 1e13 ? 0 : 2).replace(/\.?0+$/,'')}T n/s`;
+  if (nps >= 1e9) return `${(nps / 1e9).toFixed(nps >= 1e10 ? 0 : 2).replace(/\.?0+$/,'')}B n/s`;
+  if (nps >= 1e6) return `${(nps / 1e6).toFixed(nps >= 1e7 ? 0 : 1).replace(/\.?0+$/,'')}M n/s`;
+  if (nps >= 1e3) return `${(nps / 1e3).toFixed(nps >= 1e5 ? 0 : 1).replace(/\.?0+$/,'')}k n/s`;
   return `${Math.round(nps)} n/s`;
+}
+
+function formatNodeCount(nodes){
+  if (nodes >= 1e12) return `${(nodes / 1e12).toFixed(nodes >= 1e13 ? 0 : 2).replace(/\.?0+$/,'')}T nodes`;
+  if (nodes >= 1e9) return `${(nodes / 1e9).toFixed(nodes >= 1e10 ? 0 : 2).replace(/\.?0+$/,'')}B nodes`;
+  if (nodes >= 1e6) return `${(nodes / 1e6).toFixed(nodes >= 1e7 ? 0 : 1).replace(/\.?0+$/,'')}M nodes`;
+  if (nodes >= 1e3) return `${(nodes / 1e3).toFixed(nodes >= 1e5 ? 0 : 1).replace(/\.?0+$/,'')}k nodes`;
+  return `${Math.round(nodes)} nodes`;
 }
 
 function formatPrincipalVariation(pv){
@@ -567,6 +605,7 @@ function formatPrincipalVariation(pv){
 
 function renderEvalFromRaw(raw, {nodes=0, depth=0, live=false, pv=[], nps=0, searchingDepth=0}={}) {
   const norm = rawToNormalized(raw);
+  const ruminationNps = ratingToRuminationNps(aiRatingInput?.value || 1500);
 
   const cyanPct = (norm + 100) / 2;
   const redPct = 100 - cyanPct;
@@ -579,8 +618,8 @@ function renderEvalFromRaw(raw, {nodes=0, depth=0, live=false, pv=[], nps=0, sea
   if (isCurrentTurnControlledByAI()) details.push('AI thinking');
   if (depth > 0) details.push(`depth ${depth}`);
   else if (searchingDepth > 0) details.push(`searching d${searchingDepth}`);
-  if (nodes > 0) details.push(`${nodes.toLocaleString()} nodes`);
-  if (nps > 0) details.push(formatNodeRate(nps));
+  if (nodes > 0) details.push(formatNodeCount(nodes));
+  if (ruminationNps > 0) details.push(`rumination ${formatNodeRate(ruminationNps)}`);
   if (live && depth === 0 && searchingDepth === 0) details.push('live');
 
   const detailText = details.length ? ` · ${details.join(' · ')}` : '';
@@ -622,6 +661,31 @@ function createLiveAnalysisWorker(){
     const TIMEOUT = { timeout: true };
 
     function clamp(value, min, max){ return Math.max(min, Math.min(max, value)); }
+    function interpolateLogRate(rating, left, right){
+      if (left.rate <= 0 || right.rate <= 0 || right.rating === left.rating) return left.rate;
+      const t = (rating - left.rating) / (right.rating - left.rating);
+      return Math.exp(Math.log(left.rate) + (Math.log(right.rate) - Math.log(left.rate)) * t);
+    }
+    function ratingToRuminationNps(rating){
+      const anchors = [
+        { rating: 250, rate: 80e9 },
+        { rating: 500, rate: 40e9 },
+        { rating: 750, rate: 20e9 },
+        { rating: 1000, rate: 10e9 },
+        { rating: 1250, rate: 5e9 },
+        { rating: 1500, rate: 100e9 },
+        { rating: 1750, rate: 125e9 },
+        { rating: 2000, rate: 250e9 },
+        { rating: 2250, rate: 500e9 },
+        { rating: 2500, rate: 1e12 },
+        { rating: 2750, rate: 2e12 }
+      ];
+      const clamped = Math.max(anchors[0].rating, Math.min(anchors[anchors.length - 1].rating, Number(rating) || 1500));
+      for (let i = 1; i < anchors.length; i++) {
+        if (clamped <= anchors[i].rating) return interpolateLogRate(clamped, anchors[i - 1], anchors[i]);
+      }
+      return anchors[anchors.length - 1].rate;
+    }
     function toCyanScore(score, rootPlayer){ return rootPlayer === 1 ? score : -score; }
     function isForcedScore(raw){ return Number.isFinite(raw) && Math.abs(Math.trunc(raw)) >= FORCED_WIN_SCORE - MAX_GAME_PLIES; }
 
@@ -756,7 +820,7 @@ function createLiveAnalysisWorker(){
         raw: toCyanScore(state.best.score, state.rootPlayer),
         depth: state.best.depth,
         searchingDepth: state.searchingDepth,
-        nodes: state.nodes,
+        nodes: Math.round((state.ruminationNps * elapsedMs) / 1000),
         nps: Math.round((state.nodes * 1000) / elapsedMs),
         pv: state.best.pv,
         live: true,
@@ -784,8 +848,11 @@ function createLiveAnalysisWorker(){
         }
       }
 
+      if (state.nextDepth > state.maxDepth) {
+        state.searchingDepth = state.maxDepth;
+      }
       postProgress(state);
-      if (state.jobId !== activeJobId || state.nextDepth > state.maxDepth) return;
+      if (state.jobId !== activeJobId) return;
       setTimeout(() => runIterative(state), state.cooldownMs);
     }
 
@@ -807,6 +874,7 @@ function createLiveAnalysisWorker(){
         rootPlayer: data.currentPlayer,
         startedAt: performance.now(),
         nodes: 0,
+        ruminationNps: ratingToRuminationNps(data.rating),
         tt: new Map(),
         best: { score: staticSearchEval(data.board, data.currentPlayer), pv: [], depth: 0 },
         searchingDepth: 1,
