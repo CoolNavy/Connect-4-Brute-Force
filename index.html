@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Connect 4</title>
+		<link rel="stylesheet" href="style.css" />
+	</head>
+	<body>
+		<main class="app">
+			<h1>Connect 4</h1>
+
+			<section class="game">
+				<div id="board" class="board" aria-label="Connect 4 board"></div>
+				<div id="col-overlay" class="col-overlay"></div>
+			</section>
+
+			<div class="controls">
+						<div id="message" class="message">Player A's turn (Cyan)</div>
+						<button id="restart">Restart Game</button>
+						<label class="ai-control"><input type="checkbox" id="ai-toggle"> Play vs AI</label>
+						<label class="ai-control">AI plays: <select id="ai-player"><option value="2">Player B (Red)</option><option value="1">Player A (Cyan)</option></select></label>
+						<label class="ai-control">Rating: <input id="ai-rating" type="range" min="1" max="2999" value="1500"><span id="ai-class">Class A</span></label>
+			</div>
+
+							<div class="eval-container">
+								<div class="eval-bar" id="eval-bar">
+									<div id="eval-left" class="eval-left"></div>
+									<div id="eval-right" class="eval-right"></div>
+								</div>
+								<div id="eval-label" class="eval-label">Eval: 0 (Neutral)</div>
+								<div id="eval-meta" class="eval-meta"></div>
+							</div>
+
+					<div id="threats" class="threats" aria-live="polite"></div>
+
+							<section class="review-section">
+								<button id="show-review">Show Game Review</button>
+								<div id="review" class="review" hidden></div>
+							</section>
+
+			<footer class="notes">Click a column to drop a disc. First to connect 4 wins.</footer>
+		</main>
+
+		<script src="script.js"></script>
+	</body>
+</html>
