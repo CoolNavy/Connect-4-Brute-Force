@@ -109,7 +109,7 @@ button#restart{ font-family:'Orbitron', sans-serif; padding:8px 12px; border-rad
 	animation: eval-scan 1.2s linear infinite;
 	pointer-events:none;
 }
-.eval-left, .eval-right{ position:absolute; top:0; bottom:0; width:0%; transition: width 180ms linear; }
+.eval-left, .eval-right{ position:absolute; top:0; bottom:0; width:0%; transition: width 2s linear; }
 .eval-left{ right:0; background: linear-gradient(to left, var(--cyan), #00ffff); }
 .eval-right{ right:0; background: linear-gradient(to right, var(--red), #ff0000); }
 @keyframes eval-scan{
