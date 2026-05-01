@@ -19,6 +19,9 @@ const SEARCH_MOVE_ORDER = [3,2,4,1,5,0,6];
 const SEARCH_TT_EXACT = 0;
 const SEARCH_TT_LOWER = 1;
 const SEARCH_TT_UPPER = 2;
+const ANALYSIS_DB_NAME = 'cn4-analysis-cache';
+const ANALYSIS_DB_VERSION = 1;
+const ANALYSIS_STORE_NAME = 'positions';
 
 // =================== State ===================
 let board = [];
@@ -30,6 +33,8 @@ let pendingAITimeout = null; // track pending AI move for cancellation
 let analysisWorker = null;
 let analysisJobId = 0;
 let latestAnalysis = null;
+let analysisDbPromise = null;
+const analysisMemory = new Map();
 
 // =================== DOM ===================
 const boardEl = document.getElementById('board');
@@ -397,6 +402,157 @@ function boardKeyForSearch(bd, toPlay){
   return key;
 }
 
+function getAnalysisPositionKey(bd, toPlay){
+  return boardKeyForSearch(bd, toPlay);
+}
+
+function normalizePersistedAnalysis(entry){
+  if (!entry || typeof entry !== 'object' || !entry.key) return null;
+  return {
+    key: String(entry.key),
+    toPlay: Number(entry.toPlay) === 2 ? 2 : 1,
+    raw: Number(entry.raw) || 0,
+    depth: Math.max(0, Number(entry.depth) || 0),
+    pv: Array.isArray(entry.pv) ? entry.pv.filter(Number.isInteger).slice(0, 24) : [],
+    nodes: Math.max(0, Number(entry.nodes) || 0),
+    updatedAt: Math.max(0, Number(entry.updatedAt) || 0)
+  };
+}
+
+function shouldReplacePersistedAnalysis(existing, next){
+  if (!existing) return true;
+  if (next.depth !== existing.depth) return next.depth > existing.depth;
+  if (isForcedScore(next.raw) !== isForcedScore(existing.raw)) return isForcedScore(next.raw);
+  if ((next.pv?.length || 0) !== (existing.pv?.length || 0)) return (next.pv?.length || 0) > (existing.pv?.length || 0);
+  if (Math.abs(next.raw - existing.raw) > 0.5) return Math.abs(next.raw) > Math.abs(existing.raw);
+  if (next.nodes > existing.nodes) {
+    return next.nodes >= existing.nodes * 1.25 && (next.nodes - existing.nodes) >= 1e9;
+  }
+  return false;
+}
+
+function openAnalysisDb(){
+  if (analysisDbPromise !== null) return analysisDbPromise;
+  if (typeof indexedDB === 'undefined') {
+    analysisDbPromise = Promise.resolve(null);
+    return analysisDbPromise;
+  }
+
+  analysisDbPromise = new Promise((resolve)=>{
+    const request = indexedDB.open(ANALYSIS_DB_NAME, ANALYSIS_DB_VERSION);
+
+    request.onupgradeneeded = ()=>{
+      const db = request.result;
+      if (!db.objectStoreNames.contains(ANALYSIS_STORE_NAME)) {
+        db.createObjectStore(ANALYSIS_STORE_NAME, { keyPath: 'key' });
+      }
+    };
+
+    request.onsuccess = ()=> resolve(request.result);
+    request.onerror = ()=>{
+      console.warn('Analysis cache unavailable:', request.error);
+      resolve(null);
+    };
+  });
+
+  return analysisDbPromise;
+}
+
+async function readPersistedAnalysis(key){
+  if (analysisMemory.has(key)) return analysisMemory.get(key);
+  const db = await openAnalysisDb();
+  if (!db) return null;
+
+  return new Promise((resolve)=>{
+    const tx = db.transaction(ANALYSIS_STORE_NAME, 'readonly');
+    const req = tx.objectStore(ANALYSIS_STORE_NAME).get(key);
+    req.onsuccess = ()=>{
+      const normalized = normalizePersistedAnalysis(req.result);
+      if (normalized) analysisMemory.set(key, normalized);
+      resolve(normalized);
+    };
+    req.onerror = ()=> resolve(null);
+  });
+}
+
+async function persistAnalysisEntry(entry){
+  const normalized = normalizePersistedAnalysis(entry);
+  if (!normalized) return null;
+
+  const existing = analysisMemory.get(normalized.key);
+  if (!shouldReplacePersistedAnalysis(existing, normalized)) return existing;
+
+  analysisMemory.set(normalized.key, normalized);
+  const db = await openAnalysisDb();
+  if (!db) return normalized;
+
+  return new Promise((resolve)=>{
+    const tx = db.transaction(ANALYSIS_STORE_NAME, 'readwrite');
+    tx.objectStore(ANALYSIS_STORE_NAME).put(normalized);
+    tx.oncomplete = ()=> resolve(normalized);
+    tx.onerror = ()=> resolve(normalized);
+  });
+}
+
+function getKnownAnalysisSync(bd, toPlay){
+  return analysisMemory.get(getAnalysisPositionKey(bd, toPlay)) || null;
+}
+
+function convertStoredAnalysisToPlayerPerspective(entry, player){
+  if (!entry) return null;
+  return {
+    score: player === 1 ? entry.raw : -entry.raw,
+    pv: entry.pv.slice(),
+    depth: entry.depth,
+    nodes: entry.nodes,
+    source: 'cache'
+  };
+}
+
+async function restorePersistedAnalysisForCurrentPosition(jobId, bd, toPlay){
+  const key = getAnalysisPositionKey(bd, toPlay);
+  const entry = await readPersistedAnalysis(key);
+  if (!entry) return;
+  if (jobId !== analysisJobId || gameOver) return;
+  if (getAnalysisPositionKey(board, currentPlayer) !== key) return;
+  if (latestAnalysis && latestAnalysis.depth >= entry.depth) return;
+
+  latestAnalysis = {
+    jobId,
+    raw: entry.raw,
+    depth: entry.depth,
+    pv: entry.pv.slice(),
+    nps: ratingToRuminationNps(aiRatingInput?.value || 1500),
+    searchingDepth: entry.depth,
+    nodes: entry.nodes,
+    positionKey: key,
+    persistent: true
+  };
+
+  renderEvalFromRaw(entry.raw, {
+    nodes: entry.nodes,
+    depth: entry.depth,
+    live: true,
+    pv: entry.pv,
+    nps: ratingToRuminationNps(aiRatingInput?.value || 1500),
+    searchingDepth: entry.depth
+  });
+}
+
+function persistCurrentAnalysisSnapshot(bd, toPlay, analysis){
+  if (!analysis || !analysis.depth || !analysis.pv?.length) return;
+  const key = getAnalysisPositionKey(bd, toPlay);
+  void persistAnalysisEntry({
+    key,
+    toPlay,
+    raw: analysis.raw,
+    depth: analysis.depth,
+    pv: analysis.pv.slice(0, 24),
+    nodes: analysis.nodes || 0,
+    updatedAt: Date.now()
+  });
+}
+
 function getMovePriorityForSearch(bd, toPlay, col, pvMove=null){
   const opponent = toPlay === 1 ? 2 : 1;
   const res = applyMove(bd, col, toPlay);
@@ -562,11 +718,11 @@ function interpolateLogRate(rating, left, right){
 
 function ratingToRuminationNps(rating){
   const anchors = [
-    { rating: 250, rate: 80e9 },
-    { rating: 500, rate: 40e9 },
+    { rating: 250, rate: 5e9 },
+    { rating: 500, rate: 10e9 },
     { rating: 750, rate: 20e9 },
-    { rating: 1000, rate: 10e9 },
-    { rating: 1250, rate: 5e9 },
+    { rating: 1000, rate: 40e9 },
+    { rating: 1250, rate: 80e9 },
     { rating: 1500, rate: 100e9 },
     { rating: 1750, rate: 125e9 },
     { rating: 2000, rate: 250e9 },
@@ -575,27 +731,44 @@ function ratingToRuminationNps(rating){
     { rating: 2750, rate: 2e12 }
   ];
 
-  const clamped = Math.max(anchors[0].rating, Math.min(anchors[anchors.length - 1].rating, Number(rating) || 1500));
+  const numeric = Math.max(1, Number(rating) || 1500);
+  if (numeric <= anchors[0].rating) return interpolateLogRate(numeric, anchors[0], anchors[1]);
   for (let i = 1; i < anchors.length; i++) {
-    if (clamped <= anchors[i].rating) return interpolateLogRate(clamped, anchors[i - 1], anchors[i]);
+    if (numeric <= anchors[i].rating) return interpolateLogRate(numeric, anchors[i - 1], anchors[i]);
   }
-  return anchors[anchors.length - 1].rate;
+  return interpolateLogRate(numeric, anchors[anchors.length - 2], anchors[anchors.length - 1]);
+}
+
+function trimFixed(value, decimals){
+  return value.toFixed(decimals).replace(/\.?0+$/,'');
+}
+
+function formatLargeQuantity(value, suffix){
+  const abs = Math.abs(value);
+  const units = [
+    { threshold: 1e12, label: 'T' },
+    { threshold: 1e9, label: 'B' },
+    { threshold: 1e6, label: 'M' },
+    { threshold: 1e3, label: 'k' }
+  ];
+
+  for (const unit of units) {
+    if (abs >= unit.threshold) {
+      const scaled = value / unit.threshold;
+      const decimals = Math.abs(scaled) >= 100 ? 0 : Math.abs(scaled) >= 10 ? 1 : 2;
+      return `${trimFixed(scaled, decimals)}${unit.label} ${suffix}`;
+    }
+  }
+
+  return `${Math.round(value)} ${suffix}`;
 }
 
 function formatNodeRate(nps){
-  if (nps >= 1e12) return `${(nps / 1e12).toFixed(nps >= 1e13 ? 0 : 2).replace(/\.?0+$/,'')}T n/s`;
-  if (nps >= 1e9) return `${(nps / 1e9).toFixed(nps >= 1e10 ? 0 : 2).replace(/\.?0+$/,'')}B n/s`;
-  if (nps >= 1e6) return `${(nps / 1e6).toFixed(nps >= 1e7 ? 0 : 1).replace(/\.?0+$/,'')}M n/s`;
-  if (nps >= 1e3) return `${(nps / 1e3).toFixed(nps >= 1e5 ? 0 : 1).replace(/\.?0+$/,'')}k n/s`;
-  return `${Math.round(nps)} n/s`;
+  return formatLargeQuantity(nps, 'n/s');
 }
 
 function formatNodeCount(nodes){
-  if (nodes >= 1e12) return `${(nodes / 1e12).toFixed(nodes >= 1e13 ? 0 : 2).replace(/\.?0+$/,'')}T nodes`;
-  if (nodes >= 1e9) return `${(nodes / 1e9).toFixed(nodes >= 1e10 ? 0 : 2).replace(/\.?0+$/,'')}B nodes`;
-  if (nodes >= 1e6) return `${(nodes / 1e6).toFixed(nodes >= 1e7 ? 0 : 1).replace(/\.?0+$/,'')}M nodes`;
-  if (nodes >= 1e3) return `${(nodes / 1e3).toFixed(nodes >= 1e5 ? 0 : 1).replace(/\.?0+$/,'')}k nodes`;
-  return `${Math.round(nodes)} nodes`;
+  return formatLargeQuantity(nodes, 'nodes');
 }
 
 function formatPrincipalVariation(pv){
@@ -668,11 +841,11 @@ function createLiveAnalysisWorker(){
     }
     function ratingToRuminationNps(rating){
       const anchors = [
-        { rating: 250, rate: 80e9 },
-        { rating: 500, rate: 40e9 },
+        { rating: 250, rate: 5e9 },
+        { rating: 500, rate: 10e9 },
         { rating: 750, rate: 20e9 },
-        { rating: 1000, rate: 10e9 },
-        { rating: 1250, rate: 5e9 },
+        { rating: 1000, rate: 40e9 },
+        { rating: 1250, rate: 80e9 },
         { rating: 1500, rate: 100e9 },
         { rating: 1750, rate: 125e9 },
         { rating: 2000, rate: 250e9 },
@@ -680,11 +853,12 @@ function createLiveAnalysisWorker(){
         { rating: 2500, rate: 1e12 },
         { rating: 2750, rate: 2e12 }
       ];
-      const clamped = Math.max(anchors[0].rating, Math.min(anchors[anchors.length - 1].rating, Number(rating) || 1500));
+      const clamped = Math.max(1, Number(rating) || 1500);
+      if (clamped <= anchors[0].rating) return interpolateLogRate(clamped, anchors[0], anchors[1]);
       for (let i = 1; i < anchors.length; i++) {
         if (clamped <= anchors[i].rating) return interpolateLogRate(clamped, anchors[i - 1], anchors[i]);
       }
-      return anchors[anchors.length - 1].rate;
+      return interpolateLogRate(clamped, anchors[anchors.length - 2], anchors[anchors.length - 1]);
     }
     function toCyanScore(score, rootPlayer){ return rootPlayer === 1 ? score : -score; }
     function isForcedScore(raw){ return Number.isFinite(raw) && Math.abs(Math.trunc(raw)) >= FORCED_WIN_SCORE - MAX_GAME_PLIES; }
@@ -910,14 +1084,30 @@ function ensureAnalysisWorker(){
   analysisWorker.onmessage = (event)=>{
     const data = event.data || {};
     if (data.type !== 'progress' || data.jobId !== analysisJobId || gameOver) return;
+    const positionKey = getAnalysisPositionKey(board, currentPlayer);
+    if (latestAnalysis?.positionKey === positionKey && latestAnalysis.depth > data.depth) {
+      latestAnalysis.nodes = Math.max(latestAnalysis.nodes || 0, data.nodes || 0);
+      renderEvalFromRaw(latestAnalysis.raw, {
+        nodes: latestAnalysis.nodes,
+        depth: latestAnalysis.depth,
+        live: data.live,
+        pv: latestAnalysis.pv,
+        nps: data.nps,
+        searchingDepth: Math.max(data.searchingDepth || 0, latestAnalysis.depth)
+      });
+      return;
+    }
     latestAnalysis = {
       jobId: data.jobId,
       raw: data.raw,
       depth: data.depth,
       pv: Array.isArray(data.pv) ? data.pv.slice() : [],
+      nodes: data.nodes,
       nps: data.nps,
-      searchingDepth: data.searchingDepth
+      searchingDepth: data.searchingDepth,
+      positionKey
     };
+    persistCurrentAnalysisSnapshot(board, currentPlayer, latestAnalysis);
     renderEvalFromRaw(data.raw, {
       nodes: data.nodes,
       depth: data.depth,
@@ -971,6 +1161,7 @@ function startLiveAnalysis(){
     currentPlayer,
     rating
   });
+  void restorePersistedAnalysisForCurrentPosition(jobId, cloneBoard(board), currentPlayer);
 }
 
 function formatReviewScore(raw){
@@ -990,15 +1181,18 @@ function formatReviewLoss(loss, bestRaw, playedRaw){
 }
 
 function getReviewReferenceAnalysis(boardBefore, player, rating){
-  if (latestAnalysis?.jobId === analysisJobId && latestAnalysis.depth >= 2 && latestAnalysis.pv?.length) {
+  const positionKey = getAnalysisPositionKey(boardBefore, player);
+  if (latestAnalysis?.jobId === analysisJobId && latestAnalysis.positionKey === positionKey && latestAnalysis.depth >= 2 && latestAnalysis.pv?.length) {
     return {
       score: player === 1 ? latestAnalysis.raw : -latestAnalysis.raw,
       pv: latestAnalysis.pv.slice(),
       depth: latestAnalysis.depth,
-      nodes: 0,
+      nodes: latestAnalysis.nodes || 0,
       source: 'live'
     };
   }
+  const known = convertStoredAnalysisToPlayerPerspective(getKnownAnalysisSync(boardBefore, player), player);
+  if (known && known.depth >= 2 && known.pv?.length) return known;
   return analyzePositionSync(boardBefore, player, rating);
 }
 
@@ -1470,11 +1664,22 @@ async function ultraChooseAndPlay(){
   if(valid.length===0) return;
 
   // 3.5) if the live evaluator already has a credible top line, play its top move
-  const liveTopMove = latestAnalysis?.jobId === analysisJobId ? latestAnalysis?.pv?.[0] : null;
+  const persistedAnalysis = convertStoredAnalysisToPlayerPerspective(getKnownAnalysisSync(board, aiPlayer), aiPlayer);
+  const activeAnalysis =
+    latestAnalysis?.jobId === analysisJobId && latestAnalysis.positionKey === getAnalysisPositionKey(board, aiPlayer)
+      ? latestAnalysis
+      : persistedAnalysis
+        ? {
+            raw: aiPlayer === 1 ? persistedAnalysis.score : -persistedAnalysis.score,
+            depth: persistedAnalysis.depth,
+            pv: persistedAnalysis.pv.slice()
+          }
+        : null;
+  const liveTopMove = activeAnalysis?.pv?.[0] ?? null;
   const liveLineIsUsable =
     Number.isInteger(liveTopMove) &&
     valid.includes(liveTopMove) &&
-    (isForcedScore(latestAnalysis.raw) || latestAnalysis.depth >= 4);
+    (isForcedScore(activeAnalysis.raw) || activeAnalysis.depth >= 4);
   if (liveLineIsUsable) {
     handleColumnClick(liveTopMove, true);
     return;
@@ -1576,6 +1781,7 @@ function ratingToSimulations(r){
 }
 
 // =================== Initialization & events ===================
+void openAnalysisDb();
 createEmptyBoard();
 renderBoard();
 updateEvalAndThreats();
